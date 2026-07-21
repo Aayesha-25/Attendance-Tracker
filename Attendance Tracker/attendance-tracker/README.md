@@ -146,6 +146,7 @@ commands in the project history; summarized here:
 | IDOR on stats | `/api/user/:id/stats` checks `profile.studentId === req.user.studentId \|\| role === 'admin'` | Second student's token against the first student's numeric ID → `403` |
 | Password storage | `bcrypt`, cost factor 10 (see load-testing note below for why not 12) | — |
 | Enumeration via login errors | Wrong password and unknown ID return the same error/status | — |
+| Attendance backdating | `/api/checkin` only ever writes **today**, ignoring any `date` in the request — a student cannot fabricate a month of attendance in one sitting. Genuine corrections go through the separate `POST /api/checkin/correct`, admin-only | Fired the same 5-fake-past-date request that used to work — all 5 landed on today's date instead, `totalDaysPresent` for every historical day stayed `0` |
 
 **Known, accepted trade-off:** `helmet`'s CSP allows
 `script-src 'unsafe-inline'` because `frontend/index.html` uses inline
@@ -217,7 +218,8 @@ endpoint so one deployment can serve multiple concurrent events.
 | POST | `/api/auth/login` | — (rate-limited) | `{student_id, password}` → `{token, studentId, name, role}` |
 | GET | `/api/auth/me` | Bearer | Verify current identity |
 | POST/GET/DELETE | `/api/auth/roster` | Bearer + admin | Manage the closed allow-list |
-| POST | `/api/checkin` | Bearer | `{event_id, date?}` → marks present. Idempotent, rejects future dates |
+| POST | `/api/checkin` | Bearer | `{event_id}` → marks the caller present for **today only**. No `date` field — see below |
+| POST | `/api/checkin/correct` | Bearer + admin | `{event_id, user_id, date}` → admin backfills a genuinely missed scan for a past date |
 | DELETE | `/api/checkin` | Bearer + admin | `{event_id, user_id, date}` → undo a check-in |
 | GET | `/api/day-status?event_id=&date=` | Bearer + admin | Full roster split present/absent — the coordinator's default view |
 | GET | `/api/day/:date/count?event_id=` | — | Total present that day (`BITCOUNT`) |

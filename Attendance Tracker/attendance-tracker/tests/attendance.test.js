@@ -71,6 +71,22 @@ async function account(name) {
   return { token: login.body.token, id };
 }
 
+/** Resolves a user's numeric id for an event, creating the identity mapping
+ * (via GET /me/id) without marking any attendance. Needed before an admin
+ * can backfill historical dates for them through /checkin/correct. */
+async function meId(eventId, token) {
+  const { status, body } = await get(`/api/me/id?event_id=${eventId}`, token);
+  assert.equal(status, 200, `me/id should succeed: ${JSON.stringify(body)}`);
+  return body.userId;
+}
+
+/** Admin-only historical backfill — the ONLY way a non-today date can ever
+ * land in the attendance record. Fails loudly if not called with an admin
+ * token, which is exactly what several tests below are checking for. */
+async function checkinCorrect(eventId, userId, date, adminToken) {
+  return post("/api/checkin/correct", { event_id: eventId, user_id: userId, date }, adminToken);
+}
+
 // ---- auth flow -------------------------------------------------------------
 
 test("register then login returns a working token", async () => {
@@ -148,12 +164,12 @@ test("password under 8 characters is rejected", async () => {
 // ---- checkin requires auth, and trusts the token's identity --------------
 
 test("checkin without a token is rejected", async () => {
-  const { status } = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-10" });
+  const { status } = await post("/api/checkin", { event_id: EVENT_ID });
   assert.equal(status, 401);
 });
 
 test("checkin with a garbage token is rejected", async () => {
-  const { status } = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-10" }, "not-a-real-jwt");
+  const { status } = await post("/api/checkin", { event_id: EVENT_ID }, "not-a-real-jwt");
   assert.equal(status, 401);
 });
 
@@ -162,13 +178,13 @@ test("checkin marks the AUTHENTICATED user present, ignoring any identity in the
 
   const { status, body } = await post(
     "/api/checkin",
-    { event_id: EVENT_ID, date: "2026-07-10", student_id: "25CE999" }, // attempted impersonation, must be ignored
+    { event_id: EVENT_ID, student_id: "25CE999" }, // attempted impersonation, must be ignored
     token
   );
   assert.equal(status, 200);
   assert.ok(Number.isInteger(body.userId));
 
-  const stats = await get(`/api/user/${body.userId}/stats?event_id=${EVENT_ID}&start=2026-07-10&end=2026-07-10`, token);
+  const stats = await get(`/api/user/${body.userId}/stats?event_id=${EVENT_ID}&start=${body.date}&end=${body.date}`, token);
   assert.equal(stats.status, 200);
   assert.equal(stats.body.studentId, id);
   assert.equal(stats.body.totalDaysPresent, 1);
@@ -176,23 +192,46 @@ test("checkin marks the AUTHENTICATED user present, ignoring any identity in the
 
 test("re-checking in the same user/day is idempotent, not an error", async () => {
   const { token } = await account("Carol");
-  const first = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-11" }, token);
-  const second = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-11" }, token);
+  const first = await post("/api/checkin", { event_id: EVENT_ID }, token);
+  const second = await post("/api/checkin", { event_id: EVENT_ID }, token);
   assert.equal(first.body.alreadyCheckedIn, false);
   assert.equal(second.body.alreadyCheckedIn, true);
 });
 
-test("checkin rejects a future date", async () => {
-  const { token } = await account("Dave");
-  const { status, body } = await post("/api/checkin", { event_id: EVENT_ID, date: "2099-01-01" }, token);
-  assert.equal(status, 400);
-  assert.match(body.error, /future/i);
+// ---- anti-backdating: the actual security fix, locked in by these two ----
+
+test("checkin ALWAYS marks today, silently ignoring any date field the client sends", async () => {
+  const { token } = await account("Backdate Attempt");
+  // A student trying to hand-craft a request with a past date must not
+  // succeed in backdating — this is what stops "fake a whole month of
+  // attendance in one sitting."
+  const { status, body } = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-01-01" }, token);
+  assert.equal(status, 200);
+  assert.notEqual(body.date, "2026-01-01");
+});
+
+test("a non-admin cannot use /checkin/correct to backdate their own attendance", async () => {
+  const { token } = await account("Sneaky Student");
+  const userId = await meId(EVENT_ID, token);
+  const { status } = await checkinCorrect(EVENT_ID, userId, "2026-01-01", token);
+  assert.equal(status, 403);
 });
 
 test("checkin rejects malformed date", async () => {
   const { token } = await account("Eve");
-  const { status } = await post("/api/checkin", { event_id: EVENT_ID, date: "not-a-date" }, token);
+  const adminToken = await getTestAdminToken();
+  const userId = await meId(EVENT_ID, token);
+  const { status } = await checkinCorrect(EVENT_ID, userId, "not-a-date", adminToken);
   assert.equal(status, 400);
+});
+
+test("checkin/correct rejects a future date even for an admin", async () => {
+  const { token } = await account("Dave");
+  const adminToken = await getTestAdminToken();
+  const userId = await meId(EVENT_ID, token);
+  const { status, body } = await checkinCorrect(EVENT_ID, userId, "2099-01-01", adminToken);
+  assert.equal(status, 400);
+  assert.match(body.error, /future/i);
 });
 
 // ---- authorization: self vs admin vs stranger -----------------------------
@@ -200,10 +239,12 @@ test("checkin rejects malformed date", async () => {
 test("a student CANNOT view another student's stats", async () => {
   const a = await account("Priv A");
   const b = await account("Priv B");
+  const adminToken = await getTestAdminToken();
+  const userIdA = await meId(EVENT_ID, a.token);
+  await checkinCorrect(EVENT_ID, userIdA, "2026-07-12", adminToken);
 
-  const checkinA = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-12" }, a.token);
   const { status } = await get(
-    `/api/user/${checkinA.body.userId}/stats?event_id=${EVENT_ID}&start=2026-07-12&end=2026-07-12`,
+    `/api/user/${userIdA}/stats?event_id=${EVENT_ID}&start=2026-07-12&end=2026-07-12`,
     b.token
   );
   assert.equal(status, 403);
@@ -211,9 +252,9 @@ test("a student CANNOT view another student's stats", async () => {
 
 test("a student CAN view their own stats", async () => {
   const { token } = await account("Self");
-  const checkin = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-12" }, token);
+  const checkin = await post("/api/checkin", { event_id: EVENT_ID }, token);
   const { status } = await get(
-    `/api/user/${checkin.body.userId}/stats?event_id=${EVENT_ID}&start=2026-07-12&end=2026-07-12`,
+    `/api/user/${checkin.body.userId}/stats?event_id=${EVENT_ID}&start=${checkin.body.date}&end=${checkin.body.date}`,
     token
   );
   assert.equal(status, 200);
@@ -231,10 +272,10 @@ test("a non-admin CANNOT list the roster, view the grid, or view day-status", as
 
 test("a non-admin CANNOT delete/undo a check-in", async () => {
   const { token } = await account("Non Admin 2");
-  const checkin = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-13" }, token);
+  const checkin = await post("/api/checkin", { event_id: EVENT_ID }, token);
   const { status } = await del(
     "/api/checkin",
-    { event_id: EVENT_ID, user_id: checkin.body.userId, date: "2026-07-13" },
+    { event_id: EVENT_ID, user_id: checkin.body.userId, date: checkin.body.date },
     token
   );
   assert.equal(status, 403);
@@ -244,10 +285,10 @@ test("an admin CAN view any user's stats, list the roster, and undo a check-in",
   const { token: studentToken } = await account("Admin Target");
   const adminToken = await getTestAdminToken();
 
-  const checkin = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-07-14" }, studentToken);
+  const checkin = await post("/api/checkin", { event_id: EVENT_ID }, studentToken);
 
   const stats = await get(
-    `/api/user/${checkin.body.userId}/stats?event_id=${EVENT_ID}&start=2026-07-14&end=2026-07-14`,
+    `/api/user/${checkin.body.userId}/stats?event_id=${EVENT_ID}&start=${checkin.body.date}&end=${checkin.body.date}`,
     adminToken
   );
   assert.equal(stats.status, 200);
@@ -257,7 +298,7 @@ test("an admin CAN view any user's stats, list the roster, and undo a check-in",
 
   const undo = await del(
     "/api/checkin",
-    { event_id: EVENT_ID, user_id: checkin.body.userId, date: "2026-07-14" },
+    { event_id: EVENT_ID, user_id: checkin.body.userId, date: checkin.body.date },
     adminToken
   );
   assert.equal(undo.status, 200);
@@ -278,12 +319,12 @@ test("day-status splits roster into present and absent correctly", async () => {
 
   await post("/api/auth/register", { student_id: presentId, password: PASSWORD, name: "Present One" });
   const presentToken = (await post("/api/auth/login", { student_id: presentId, password: PASSWORD })).body.token;
-  await post("/api/checkin", { event_id: eid, date: "2026-07-01" }, presentToken);
+  const checkin = await post("/api/checkin", { event_id: eid }, presentToken);
 
   await post("/api/auth/register", { student_id: absentRegisteredId, password: PASSWORD, name: "Absent Registered" });
   // deliberately does NOT check in
 
-  const { status, body } = await get(`/api/day-status?event_id=${eid}&date=2026-07-01`, adminToken);
+  const { status, body } = await get(`/api/day-status?event_id=${eid}&date=${checkin.body.date}`, adminToken);
   assert.equal(status, 200);
   // The roster is deliberately GLOBAL (it represents "valid college
   // students", not "enrolled in this one event"), so other tests running
@@ -309,13 +350,16 @@ test("day-status splits roster into present and absent correctly", async () => {
 
 test("longest streak vs current streak differ correctly across a gap", async () => {
   const { token } = await account("Streak Test");
-  await post("/api/checkin", { event_id: EVENT_ID, date: "2026-06-01" }, token);
-  await post("/api/checkin", { event_id: EVENT_ID, date: "2026-06-02" }, token);
-  await post("/api/checkin", { event_id: EVENT_ID, date: "2026-06-03" }, token);
-  const last = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-06-05" }, token);
+  const adminToken = await getTestAdminToken();
+  const userId = await meId(EVENT_ID, token);
+
+  await checkinCorrect(EVENT_ID, userId, "2026-06-01", adminToken);
+  await checkinCorrect(EVENT_ID, userId, "2026-06-02", adminToken);
+  await checkinCorrect(EVENT_ID, userId, "2026-06-03", adminToken);
+  await checkinCorrect(EVENT_ID, userId, "2026-06-05", adminToken);
 
   const { body } = await get(
-    `/api/user/${last.body.userId}/stats?event_id=${EVENT_ID}&start=2026-06-01&end=2026-06-05`,
+    `/api/user/${userId}/stats?event_id=${EVENT_ID}&start=2026-06-01&end=2026-06-05`,
     token
   );
   assert.equal(body.totalDaysPresent, 4);
@@ -325,7 +369,7 @@ test("longest streak vs current streak differ correctly across a gap", async () 
 
 test("stats rejects an oversized date range (DoS guard)", async () => {
   const { token } = await account("Range Test");
-  const checkin = await post("/api/checkin", { event_id: EVENT_ID, date: "2026-06-01" }, token);
+  const checkin = await post("/api/checkin", { event_id: EVENT_ID }, token);
   const { status, body } = await get(
     `/api/user/${checkin.body.userId}/stats?event_id=${EVENT_ID}&start=1970-01-01&end=2099-12-31`,
     token
@@ -340,10 +384,13 @@ test("overlap counts only users present on ALL given days", async () => {
   const eid = `overlap-test-${Date.now()}`;
   const frank = await account("Frank");
   const grace = await account("Grace");
+  const adminToken = await getTestAdminToken();
+  const frankId = await meId(eid, frank.token);
+  const graceId = await meId(eid, grace.token);
 
-  await post("/api/checkin", { event_id: eid, date: "2026-07-01" }, frank.token);
-  await post("/api/checkin", { event_id: eid, date: "2026-07-02" }, frank.token);
-  await post("/api/checkin", { event_id: eid, date: "2026-07-01" }, grace.token);
+  await checkinCorrect(eid, frankId, "2026-07-01", adminToken);
+  await checkinCorrect(eid, frankId, "2026-07-02", adminToken);
+  await checkinCorrect(eid, graceId, "2026-07-01", adminToken);
 
   const { body } = await get(`/api/overlap?event_id=${eid}&dates=2026-07-01,2026-07-02`);
   assert.equal(body.overlapCount, 1);
@@ -353,10 +400,14 @@ test("concurrent overlap requests do not corrupt each other (scratch-key collisi
   const eid = `overlap-concurrency-${Date.now()}`;
   const u1 = await account("U1");
   const u2 = await account("U2");
-  await post("/api/checkin", { event_id: eid, date: "2026-07-01" }, u1.token);
-  await post("/api/checkin", { event_id: eid, date: "2026-07-02" }, u1.token);
-  await post("/api/checkin", { event_id: eid, date: "2026-07-01" }, u2.token);
-  await post("/api/checkin", { event_id: eid, date: "2026-07-03" }, u2.token);
+  const adminToken = await getTestAdminToken();
+  const u1Id = await meId(eid, u1.token);
+  const u2Id = await meId(eid, u2.token);
+
+  await checkinCorrect(eid, u1Id, "2026-07-01", adminToken);
+  await checkinCorrect(eid, u1Id, "2026-07-02", adminToken);
+  await checkinCorrect(eid, u2Id, "2026-07-01", adminToken);
+  await checkinCorrect(eid, u2Id, "2026-07-03", adminToken);
 
   const [r1, r2] = await Promise.all([
     get(`/api/overlap?event_id=${eid}&dates=2026-07-01,2026-07-02`),

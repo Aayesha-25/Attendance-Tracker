@@ -23,36 +23,61 @@ function badRequest(res, message) {
 }
 
 // ---- POST /checkin ---------------------------------------------------
-// Body: { event_id, date? }. Identity comes from the verified JWT, NEVER
-// from the request body — this is the fix for the core problem: without
-// it, anyone could POST any identity and check attendance in for someone
+// Body: { event_id }. Identity comes from the verified JWT, NEVER from
+// the request body — this is the fix for the core problem: without it,
+// anyone could POST any identity and check attendance in for someone
 // else. Now the token you're logged in as IS the person being marked
 // present; there is no identity field to spoof.
-// date defaults to today. Idempotent — re-checking-in same day is a 200,
-// not a 409, since a network retry hitting this twice should never
-// surface as an error to the caller.
+//
+// ALWAYS marks today, for everyone, no exceptions — including admins.
+// There is deliberately no `date` field here anymore. Without this, a
+// student can fire N requests with N different past dates in one
+// sitting and fabricate a whole month of attendance instantly. Backdated
+// corrections (a genuinely missed scan) go through the separate
+// admin-only POST /checkin/correct below, which is explicit about
+// WHO is correcting WHOSE record, rather than overloading this endpoint
+// with a role-conditional date field.
 router.post("/checkin", requireAuth, async (req, res, next) => {
   try {
-    const { event_id, date } = req.body;
+    const { event_id } = req.body;
     const { studentId, name } = req.user; // from verified token, not the body
 
     if (!event_id) return badRequest(res, "event_id is required");
 
-    const dateStr = date || toDateStr();
-    if (!isValidDateStr(dateStr)) return badRequest(res, "date must be YYYY-MM-DD");
-
-    // Reject future-dated check-ins. Without this, a client bug (or a
-    // deliberately tampered request) can pre-mark attendance for a day
-    // that hasn't happened yet — a real integrity issue for an actual
-    // attendance record, not just a cosmetic validation gap.
-    if (dateStr > toDateStr()) {
-      return badRequest(res, "cannot check in for a future date");
-    }
+    const dateStr = toDateStr();
 
     const userId = await getOrCreateUserId(event_id, studentId, name);
     const { alreadyCheckedIn } = await attendanceService.checkIn(event_id, userId, dateStr);
 
     res.status(200).json({ userId, eventId: event_id, date: dateStr, alreadyCheckedIn });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---- POST /checkin/correct ---------------------------------------------
+// Body: { event_id, user_id, date }. Admin-only: marks an EXISTING user
+// present for a specific past date, to fix a genuinely missed scan (e.g.
+// the QR scanner was down for ten minutes). Deliberately a separate,
+// explicitly-named endpoint from the self-service POST /checkin above —
+// "I am checking myself in for today" and "an admin is backdating
+// someone else's record" are different actions with different trust
+// levels and should never share one endpoint with a conditional flag.
+// Mirrors DELETE /checkin (undo) in shape; this is its "add" counterpart.
+router.post("/checkin/correct", requireAuth, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { event_id, user_id, date } = req.body;
+    if (!event_id) return badRequest(res, "event_id is required");
+
+    const userId = Number(user_id);
+    if (!Number.isInteger(userId) || userId < 0) {
+      return badRequest(res, "user_id must be a non-negative integer");
+    }
+    if (!date || !isValidDateStr(date)) return badRequest(res, "date must be YYYY-MM-DD");
+    if (date > toDateStr()) return badRequest(res, "cannot correct a future date");
+
+    const { alreadyCheckedIn } = await attendanceService.checkIn(event_id, userId, date);
+    res.status(200).json({ userId, eventId: event_id, date, alreadyCheckedIn });
   } catch (err) {
     next(err);
   }
